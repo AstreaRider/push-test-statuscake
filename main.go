@@ -1,80 +1,113 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
+	"io"
+	"net/http"
 	"strings"
 	"time"
 
 	"github.com/go-ping/ping"
 )
 
-func pingServer(host string, pingCount int) (*ping.Statistics, error) {
-	// Membuat instance pinger
+type Pinger struct {
+	Timeout time.Duration
+	Count   int
+}
+
+func getAvgRtt(host string, pc, timeout Pinger) (time.Duration, error) {
 	pinger, err := ping.NewPinger(host)
 
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
 
-	// Konfigurasi jumlah paket ping yang akan dikirim
-	pinger.Count = pingCount
-
-	// Mulai ping
+	pinger.Timeout = timeout.Timeout
+	pinger.Count = pc.Count
 	err = pinger.Run()
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
+	avgRtt := pinger.Statistics().AvgRtt
 
-	// Mendapatkan hasil ping setelah selesai
-	return pinger.Statistics(), nil
+	return avgRtt, nil
 }
 
-func getServers(hosts string) []string {
+func getFlags(hosts, pk, testID string) ([]string, string, string, error) {
 	flag.StringVar(&hosts, "host", "", "List of Server Hosts")
+	flag.StringVar(&pk, "pk", "", "Statuscake PK")
+	flag.StringVar(&testID, "test-id", "", "Statuscake Test ID")
 	flag.Parse()
 
-	hostList := strings.Split(hosts, " ")
-	return hostList
-}
-
-func printResult(host string) {
-	stats, err := pingServer(host, 4)
-	if err != nil {
-		fmt.Println(err)
-	} else {
-		fmt.Println("===============================================")
-		fmt.Printf("Host: %v\n", host)
-		fmt.Printf("Ping Result - Sent: %v, Received: %v, Lost: %v\n", stats.PacketsSent, stats.PacketsRecv, stats.PacketLoss)
-		fmt.Printf("Min/Max/Avg latency: %v / %v / %v\n", stats.MinRtt, stats.MaxRtt, stats.AvgRtt)
+	if hosts == "" || pk == "" || testID == "" {
+		return nil, "", "", errors.New("Error making request, usage example push-test-statuscake --host=<host-1,host2,..> --pk=<pk-statuscake> --test-id=<test-id-statuscake>\n")
 	}
+
+	hostList := strings.Split(hosts, ",")
+	return hostList, pk, testID, nil
 }
 
-func getAvgRtt(host string) time.Duration {
-	stats, _ := pingServer(host, 4)
-	return stats.AvgRtt
-}
-
-func getAverage(values []time.Duration) time.Duration {
+func getAvgRtts(rtts []time.Duration) time.Duration {
 	var avg time.Duration
-	for _, v := range values {
+	for _, v := range rtts {
 		avg += v
 	}
-	return avg / time.Duration(len(values))
+	return avg / time.Duration(len(rtts))
+}
+
+func timeToIntConverter(v time.Duration) int {
+	rounded := v / time.Millisecond * time.Millisecond
+	return int(rounded.Milliseconds())
+}
+
+func createPushUrl(pk, testId string, timeLoad int) string {
+	return fmt.Sprintf("https://push.statuscake.com/?PK=%v&TestID=%v&time=%v", pk, testId, timeLoad)
+}
+
+func createPushTest(url string) (string, error) {
+	res, err := http.Get(url)
+	if err != nil {
+		return "", err
+	}
+
+	defer res.Body.Close()
+
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		return "", err
+	}
+	return string(body), nil
 }
 
 func main() {
 	var hosts string
+	var primaryKey string
+	var testID string
+	timeout := 5 * time.Second
 
-	hostList := getServers(hosts)
-
-	avgRtt := make([]time.Duration, len(hostList))
-
-	for i, host := range hostList {
-		printResult(host)
-		avgRtt[i] = getAvgRtt(host)
+	listOfHost, pk, tID, errFlags := getFlags(hosts, primaryKey, testID)
+	if errFlags != nil {
+		panic(errFlags)
 	}
-	avg := getAverage(avgRtt)
-	fmt.Println("===============================================")
-	fmt.Printf("Rata-Rata: %v\n", avg)
+
+	avgRtts := make([]time.Duration, len(listOfHost))
+	for i, host := range listOfHost {
+		avgRtt, err := getAvgRtt(host, Pinger{Count: 4}, Pinger{Timeout: timeout})
+		if err != nil {
+			fmt.Printf("Error pinging host: %v\n", err)
+			return
+		}
+		avgRtts[i] = avgRtt
+	}
+	avg := getAvgRtts(avgRtts)
+	timeLoad := timeToIntConverter(avg)
+	pushUrl := createPushUrl(pk, tID, timeLoad)
+	pushTest, errCreatePushTest := createPushTest(pushUrl)
+	if errCreatePushTest != nil {
+		fmt.Printf("Error making request: %v", errCreatePushTest)
+		return
+	}
+	fmt.Printf("Push test result : %v\n", pushTest)
 }
